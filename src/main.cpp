@@ -8,11 +8,55 @@
 #include "Eigen-3.3/Eigen/Core"
 #include "Eigen-3.3/Eigen/QR"
 #include "json.hpp"
+#include "spline.h"
 
 using namespace std;
 
+double car_acceptable_boost=1.2;
+double legal_speed_limit = 49.5;
+double speed_lookahead = 30;
+double behaviour_cost_lookahead_distance=speed_lookahead+5;
+
 // for convenience
 using json = nlohmann::json;
+
+class Car {
+
+public:
+	double x,y,yaw,prev_speed;
+	double s,d;
+	int _lane;
+	double _next_speed;
+
+	Car(const json& input, const int lane) {
+		x = input["x"];
+		y = input["y"];
+		s = input["s"];
+		d = input["d"];
+		yaw = input["yaw"];
+		prev_speed = input["speed"];
+		_lane = lane;
+	}
+
+	void setNextSpeed(const double nspeed) {
+		_next_speed = nspeed;
+	}
+};
+
+struct Road {
+	json previous_path_x, previous_path_y;
+	double end_path_s, end_path_d;
+
+	Road(const json& input) {
+		 previous_path_x = input["previous_path_x"];
+		 previous_path_y = input["previous_path_y"];
+		 // Previous path's end s and d values
+		 end_path_s = input["end_path_s"];
+		 end_path_d = input["end_path_d"];
+	}
+};
+
+
 
 // For converting back and forth between radians and degrees.
 constexpr double pi() { return M_PI; }
@@ -32,6 +76,115 @@ string hasData(string s) {
     return s.substr(b1, b2 - b1 + 2);
   }
   return "";
+}
+
+void apply_trajectory_KL(const json& sensor_fusion, Car& car, const Road& road) {
+
+	// set to maximum value. All functions are allowed to lower, but not to increase!
+	car.setNextSpeed(10000);
+
+	// iterate over all cars
+	for(int carIdx=0; carIdx<sensor_fusion.size(); carIdx++) {
+		float other_d = sensor_fusion[carIdx][6];
+		// does the car collides with our car?
+		if(other_d < (2+4*car._lane+2) && other_d > (2+4*car._lane-2)) {
+			double vx = sensor_fusion[carIdx][3];
+			double vy = sensor_fusion[carIdx][4];
+			double check_speed = sqrt(vx*vx+vy*vy);
+			double check_car_s = sensor_fusion[carIdx][5];
+			double distance_to_car = check_car_s - car.s;
+
+			// where will the car be in the future?
+			if( (check_car_s > car.s) && distance_to_car < speed_lookahead) {
+				// are we driving approximately the same speed as the other car?
+				if( fabs(check_speed - car.prev_speed) < 0.001 ) {
+					// we're driving at the same speed; make sure no collision
+					// make sure to drive a little slower
+					if( check_speed < car.prev_speed) {
+						// other car is driving a little slower
+						if( car._next_speed > check_speed) {
+							car.setNextSpeed(check_speed);
+						}
+					}
+				}
+
+				// car slower than ours or faster than ours?
+				else {
+					// car is slower
+					if( car._next_speed > check_speed) {
+						car.setNextSpeed(check_speed);
+					}
+				}
+			}
+		}
+	}
+
+	// post processing
+	// increase speed?
+	if( fabs(car._next_speed - car.prev_speed) < 0.001 ) {
+		// just have similar speed
+	}
+	else if( car._next_speed > car.prev_speed) {
+		if(car.prev_speed <= 0.0001) {
+			car.setNextSpeed(car_acceptable_boost);
+		} else {
+			// how much faster?
+			double rate = car._next_speed / car.prev_speed;
+			double no_jerk_rate = (rate > car_acceptable_boost) ? car_acceptable_boost : rate;
+			car.setNextSpeed(car.prev_speed * no_jerk_rate);
+			//car.setNextSpeed(car.prev_speed + .5);
+		}
+	} else {
+		// problem with decreasing is that we don't filter out jerk, as we might need emergency brake
+		// let's say we have to make sure in 25 timeframes we have to match that speed
+		//double rate = (car.prev_speed - car._next_speed) / 25;
+		/*car.setNextSpeed(car.prev_speed / car_acceptable_boost);*/
+		car.setNextSpeed(car.prev_speed /1.1);
+	}
+
+	// speed limit ;)
+	if(car._next_speed > legal_speed_limit) {
+		car.setNextSpeed(legal_speed_limit);
+	}
+
+	cout << car.prev_speed << ", " << car._next_speed << ", " << fabs( car.prev_speed - car._next_speed ) << endl;
+}
+
+bool is_car_in_the_way_for_lane_change(const json& sensor_fusion, Car& car, const int& lane) {
+	double my_car_behind_s = car.s - 10;
+	double my_car_front_s = car.s + 20;
+
+	// is there a car int he lane?
+	for(int carIdx=0; carIdx<sensor_fusion.size(); carIdx++) {
+		float other_d = sensor_fusion[carIdx][6];
+		// does the car collides with our car?
+		if(other_d < (2+4*lane+2) && other_d > (2+4*lane-2)) {
+			double check_car_s = sensor_fusion[carIdx][5];
+
+			if( check_car_s > my_car_behind_s && check_car_s < my_car_front_s) {
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
+void apply_trajectory_LCL(const json& sensor_fusion, Car& car, const Road& road, int& lane) {
+
+	if( is_car_in_the_way_for_lane_change(sensor_fusion, car, lane-1) ) {
+		apply_trajectory_KL(sensor_fusion, car, road);
+	} else {
+		lane -=1;
+	}
+}
+
+void apply_trajectory_LCR(const json& sensor_fusion, Car& car, const Road& road, int& lane) {
+
+	if( is_car_in_the_way_for_lane_change(sensor_fusion, car, lane+1) ) {
+		apply_trajectory_KL(sensor_fusion, car, road);
+	} else {
+		lane +=1;
+	}
 }
 
 double distance(double x1, double y1, double x2, double y2)
@@ -159,6 +312,169 @@ vector<double> getXY(double s, double d, const vector<double> &maps_s, const vec
 
 }
 
+void predict(const json& sensor_fusion) {
+	for(int carIdx=0; carIdx<sensor_fusion.size(); carIdx++) {
+		float other_d = sensor_fusion[carIdx][6];
+	}
+}
+
+double cost_for_lane(const Car& myself, const int lane, const json& sensor_fusion) {
+
+	double shortest_car_distance_front = numeric_limits<double>::infinity();
+	double shortest_car_speed_front = numeric_limits<double>::infinity();
+
+	// based on speed
+	for(int carIdx=0; carIdx<sensor_fusion.size(); carIdx++) {
+		float other_d = sensor_fusion[carIdx][6];
+
+		// is the car in the required lane?
+		if(other_d < (2+4*lane+2) && other_d > (2+4*lane-2)) {
+			// yes, find the first car in front, and check distance and speed
+			double vx = sensor_fusion[carIdx][3];
+			double vy = sensor_fusion[carIdx][4];
+			double check_speed = sqrt(vx*vx+vy*vy);
+			double check_car_s = sensor_fusion[carIdx][5];
+			double distance_to_car = check_car_s - myself.s;
+
+			// where will the car be in the future?
+			if( (check_car_s > myself.s) && distance_to_car < behaviour_cost_lookahead_distance && distance_to_car < shortest_car_distance_front) {
+				// newest shortest in front
+				shortest_car_distance_front = distance_to_car;
+				shortest_car_speed_front = check_speed;
+			}
+		}
+	}
+
+	// if we didn't find a result
+	if( shortest_car_distance_front > 10000000.) {
+		// cost is optimal
+		return 0;
+	} else {
+		double cost_for_distance = 1. - (shortest_car_distance_front/behaviour_cost_lookahead_distance);
+		double cost_for_speed = 1. - shortest_car_speed_front / 60.;
+		//return  cost_for_distance * cost_for_speed;
+		return cost_for_speed;
+	}
+}
+
+void moveCar(const Car& car, const Road& road, const vector<double>& map_waypoints_x, const vector<double>& map_waypoints_y,
+		const vector<double>& map_waypoints_s, const vector<double>& map_waypoints_dx, const vector<double>& map_waypoints_dy,
+		vector<double>& next_x_vals, vector<double>& next_y_vals) {
+
+	// some easy references
+	int prev_size = road.previous_path_x.size();
+
+	// create a list of from which to generate a spline
+	vector<double> ptsx;
+	vector<double> ptsy;
+
+	//the current cars coordinates
+	double ref_x = car.x;
+	double ref_y = car.y;
+	double ref_yaw = deg2rad(car.yaw);
+
+	// if the list of previous points is (almost) empty, use the car as the starting reference
+	// we store those 2 points to have the proper starting point for our spline, and the proper initial angle
+	if( prev_size < 2 ) {
+		// use the current car's position as the reference
+		double prev_car_x = car.x - cos(car.yaw);
+		double prev_car_y = car.y - sin(car.yaw);
+
+		ptsx.push_back(prev_car_x);
+		ptsx.push_back(car.x);
+		ptsy.push_back(prev_car_y);
+		ptsy.push_back(car.y);
+	} else {
+		// there's enough points left in the array of previously generated points
+		// select the last one as the current position
+		ref_x = road.previous_path_x[prev_size-1];
+		ref_y = road.previous_path_y[prev_size-1];
+
+		// and the one before latest as the position one t before
+		double ref_x_prev = road.previous_path_x[prev_size-2];
+		double ref_y_prev = road.previous_path_y[prev_size-2];
+		// and calculate the 'current' yaw based on the two last points
+		ref_yaw = atan2(ref_y-ref_y_prev, ref_x-ref_x_prev);
+
+		// store the two latest points in our array
+		ptsx.push_back(ref_x_prev);
+		ptsx.push_back(ref_x);
+		ptsy.push_back(ref_y_prev);
+		ptsy.push_back(ref_y);
+	}
+
+	// we now have the two latest points in our array. To generate next points the steps are:
+	// 1. create 3 points 'far' away (they keep lane changes,speed etc into account. We have one point 30meters ahead, one 60 meters ahead and one 90 meters ahead
+	vector<double> next_mp0 = getXY(car.s+30, (2+4*car._lane), map_waypoints_s, map_waypoints_x, map_waypoints_y);
+	vector<double> next_mp1 = getXY(car.s+50, (2+4*car._lane), map_waypoints_s, map_waypoints_x, map_waypoints_y);
+	vector<double> next_mp2 = getXY(car.s+70, (2+4*car._lane), map_waypoints_s, map_waypoints_x, map_waypoints_y);
+	vector<double> next_mp3 = getXY(car.s+90, (2+4*car._lane), map_waypoints_s, map_waypoints_x, map_waypoints_y);
+
+	// store them into our array of path generation points
+	ptsx.push_back(next_mp0[0]);
+	ptsx.push_back(next_mp1[0]);
+	ptsx.push_back(next_mp2[0]);
+	ptsx.push_back(next_mp3[0]);
+
+	ptsy.push_back(next_mp0[1]);
+	ptsy.push_back(next_mp1[1]);
+	ptsy.push_back(next_mp2[1]);
+	ptsy.push_back(next_mp3[1]);
+
+	// 2. generate a spline through those points. As the first two points contain the proper angle, it will properly
+	// 'continue' on the previously generated splines from which the points are already on the previous_path
+	// first, to make the math easier afterwards, a transformation is performed to shift the points into the cars coordinate system
+	for(int i=0; i<ptsx.size(); i++) {
+		// precalculate how much we need to shift (=difference between the current point and the cars location)
+		// This also implies we'll have to perform the inverse transformation later on to have the points in the
+		// original x/y coordinate system
+		double shift_x = ptsx[i]-ref_x;
+		double shift_y = ptsy[i]-ref_y;
+
+		// rotation + translation
+		ptsx[i] = (shift_x * cos(0-ref_yaw)-shift_y*sin(0-ref_yaw));
+		ptsy[i] = (shift_x * sin(0-ref_yaw)+shift_y*cos(0-ref_yaw));
+	}
+
+	// generate the spline through our points
+	tk::spline s;
+	s.set_points(ptsx, ptsy);
+	// precalculate some of the parameters to use later on for the extra point generation
+	double target_x = 30; // in 30meters...
+	double target_y = s(target_x); // what's the spline's y-value for the specified x-value
+	double target_dist = sqrt((target_x*target_x)+(target_y*target_y));
+	// TODO: preoper velocity!
+	double N = target_dist/(.02 * car._next_speed / 2.24);
+
+	// 3. fill the array with points
+	// fill the new list of points with all left-over points of the previously generated points
+	for(int i=0; i<road.previous_path_x.size(); i++) {
+		next_x_vals.push_back(road.previous_path_x[i]);
+		next_y_vals.push_back(road.previous_path_y[i]);
+	}
+
+	// and now, generate more points to fill the array
+	double x_add_on = 0;
+	for(int i=1; i<=50-prev_size; i++) {
+		double x_point = x_add_on + (target_x) / N; // the next x-point
+		double y_point = s(x_point); // the next y-point (provided by the spline)
+		x_add_on = x_point;
+
+		// remember to transfer the points back from car coordinates into worls coordinates
+		double x_ref = x_point;
+		double y_ref = y_point;
+
+		x_point = (x_ref * cos(ref_yaw) - y_ref * sin(ref_yaw));
+		y_point = (x_ref * sin(ref_yaw) + y_ref * cos(ref_yaw));
+
+		x_point += ref_x;
+		y_point += ref_y;
+
+		next_x_vals.push_back(x_point);
+		next_y_vals.push_back(y_point);
+	}
+}
+
 int main() {
   uWS::Hub h;
 
@@ -170,7 +486,7 @@ int main() {
   vector<double> map_waypoints_dy;
 
   // Waypoint map to read from
-  string map_file_ = "../data/highway_map.csv";
+  string map_file_ = "./data/highway_map.csv";
   // The max s value before wrapping around the track back to 0
   double max_s = 6945.554;
 
@@ -196,7 +512,9 @@ int main() {
   	map_waypoints_dy.push_back(d_y);
   }
 
-  h.onMessage([&map_waypoints_x,&map_waypoints_y,&map_waypoints_s,&map_waypoints_dx,&map_waypoints_dy](uWS::WebSocket<uWS::SERVER> ws, char *data, size_t length,
+  int lane = 1;
+
+  h.onMessage([&map_waypoints_x,&map_waypoints_y,&map_waypoints_s,&map_waypoints_dx,&map_waypoints_dy,&lane](uWS::WebSocket<uWS::SERVER> ws, char *data, size_t length,
                      uWS::OpCode opCode) {
     // "42" at the start of the message means there's a websocket message event.
     // The 4 signifies a websocket message
@@ -216,12 +534,13 @@ int main() {
           // j[1] is the data JSON object
           
         	// Main car's localization Data
-          	double car_x = j[1]["x"];
+          	/*double car_x = j[1]["x"];
           	double car_y = j[1]["y"];
           	double car_s = j[1]["s"];
           	double car_d = j[1]["d"];
           	double car_yaw = j[1]["yaw"];
-          	double car_speed = j[1]["speed"];
+          	double car_speed = j[1]["speed"];*/
+
 
           	// Previous path data given to the Planner
           	auto previous_path_x = j[1]["previous_path_x"];
@@ -233,11 +552,45 @@ int main() {
           	// Sensor Fusion Data, a list of all other cars on the same side of the road.
           	auto sensor_fusion = j[1]["sensor_fusion"];
 
+          	Car myself = Car(j[1], lane);
+          	Road road = Road(j[1]);
+
+          	if( previous_path_x.size() > 0) {
+          		myself.s = end_path_s;
+          	}
+
           	json msgJson;
 
           	vector<double> next_x_vals;
           	vector<double> next_y_vals;
 
+
+          	// definitions
+
+          	// 1. prediction
+
+          	// 2. behaviour planning
+          	string next_state = "KL";
+          	double cost_for_KL =  (0.9 * cost_for_lane(myself, lane, sensor_fusion));
+          	double cost_for_LCL = (lane == 0 ) ? 5 : .1 + (.9 * cost_for_lane(myself, lane-1, sensor_fusion) );
+          	double cost_for_LCR = (lane == 2 ) ? 5 : .1 + (.098 * cost_for_lane(myself, lane+1, sensor_fusion) );
+
+          	if(lane != 2 && cost_for_LCR < cost_for_KL && cost_for_LCR < cost_for_LCL ) {
+          		next_state = "LCR";
+          	} else if( lane != 0 && cost_for_LCL < cost_for_KL && cost_for_LCL < cost_for_LCR ) {
+          		next_state = "LCL";
+          	}
+
+          	// TODO: remove this
+          	if( myself.prev_speed < 20 && next_state != "KL") {
+          		next_state = "KL";
+          	}
+
+          	// 3. trajectory generation
+          	if( next_state == "KL" ) apply_trajectory_KL(sensor_fusion, myself, road);
+          	if( next_state == "LCL") apply_trajectory_LCL(sensor_fusion, myself, road, lane);
+          	if( next_state == "LCR") apply_trajectory_LCR(sensor_fusion, myself, road, lane);
+          	moveCar(myself, road, map_waypoints_x, map_waypoints_y, map_waypoints_s, map_waypoints_dx, map_waypoints_dy, next_x_vals, next_y_vals);
 
           	// TODO: define a path made up of (x,y) points that the car will visit sequentially every .02 seconds
           	msgJson["next_x"] = next_x_vals;
@@ -247,7 +600,7 @@ int main() {
 
           	//this_thread::sleep_for(chrono::milliseconds(1000));
           	ws.send(msg.data(), msg.length(), uWS::OpCode::TEXT);
-          
+
         }
       } else {
         // Manual driving
@@ -260,7 +613,7 @@ int main() {
   // We don't need this since we're not using HTTP but if it's removed the
   // program
   // doesn't compile :-(
-  h.onHttpRequest([](uWS::HttpResponse *res, uWS::HttpRequest req, char *data,
+ /* h.onHttpRequest([](uWS::HttpResponse *res, uWS::HttpRequest req, char *data,
                      size_t, size_t) {
     const std::string s = "<h1>Hello world!</h1>";
     if (req.getUrl().valueLength == 1) {
@@ -279,7 +632,7 @@ int main() {
                          char *message, size_t length) {
     ws.close();
     std::cout << "Disconnected" << std::endl;
-  });
+  });*/
 
   int port = 4567;
   if (h.listen(port)) {
