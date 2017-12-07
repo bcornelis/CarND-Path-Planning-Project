@@ -1,5 +1,35 @@
 # CarND-Path-Planning-Project
 Self-Driving Car Engineer Nanodegree Program
+
+### Implementation
+The main loop contains the following steps:
+1. Prediction: predict where other cars will be in the next x timesteps
+2. Behaviour planning: which lane change moves are possible; and at which cost?
+3. Trajectory generation: apply the path from the behaviour planning step
+
+#### Prediction
+This step is implemented in the 'predict' method (line 281) and has sensor fusion data as input parameters. It will create a list for every car which are the steps the system expects the car to be in x timeframes. We'll only calculate the positions for the new points to be generated (therefore, we need the prev_size parameter)
+
+#### Behaviour Planning
+The behaviour planning module will assign a cost to each possible action (LaneChangeLeft,KeepLane,LaneChangeRight). The cost is implemented in the cost_for_lane method on line 318, and has the following logic
+for the required lane:
+* find for the car closest to the ego car
+* get it's speed and distance
+* based on the speed and distance generate a cost value
+The cost function will be lower as the speed gets higher and the distance to the other car gets higher.
+
+There's some modifications to the result (lines 585 - 593):
+* the cost will be 5. if an impossible lane-change is chosen (for example: LCL if we're already on the leftmost lane)
+
+#### Trajectory Generation
+Apply the trajectory with the lowest cost (lines 596 - 599).
+The logic of the lane change methods is:
+* first detect whether a collision will happen; if it's the case apply the KL logic
+* if no collision will happen (based on the predicted car states) apply the lane change
+The logic for the KL method is (line 90)
+* find the car closest in front
+* if there is one, adapt to the speed of this car
+* if none is there, apply the max speed.
    
 ### Simulator.
 You can download the Term3 Simulator which contains the Path Planning Project from the [releases tab (https://github.com/udacity/self-driving-car-sim/releases).
