@@ -12,10 +12,13 @@
 
 using namespace std;
 
-double car_acceptable_boost=1.2;
-double legal_speed_limit = 49.5;
+double car_acceptable_boost=.224;
+double const legal_speed_limit = 49.5;
 double speed_lookahead = 30;
 double behaviour_cost_lookahead_distance=speed_lookahead+5;
+int prediction_steps = 30;
+
+double approx_speed = car_acceptable_boost;
 
 // for convenience
 using json = nlohmann::json;
@@ -56,6 +59,12 @@ struct Road {
 	}
 };
 
+struct Prediction {
+	int s;
+	double d;
+	double speed;
+};
+
 
 
 // For converting back and forth between radians and degrees.
@@ -78,110 +87,67 @@ string hasData(string s) {
   return "";
 }
 
-void apply_trajectory_KL(const json& sensor_fusion, Car& car, const Road& road) {
+void apply_trajectory_KL(map<int, vector<Prediction>>& predictions, Car& car, const Road& road) {
 
 	// set to maximum value. All functions are allowed to lower, but not to increase!
 	car.setNextSpeed(10000);
 
 	// iterate over all cars
-	for(int carIdx=0; carIdx<sensor_fusion.size(); carIdx++) {
-		float other_d = sensor_fusion[carIdx][6];
+	for(int carIdx=0; carIdx<predictions.size(); carIdx++) {
+		float other_d = predictions[carIdx][0].d;
 		// does the car collides with our car?
 		if(other_d < (2+4*car._lane+2) && other_d > (2+4*car._lane-2)) {
-			double vx = sensor_fusion[carIdx][3];
-			double vy = sensor_fusion[carIdx][4];
-			double check_speed = sqrt(vx*vx+vy*vy);
-			double check_car_s = sensor_fusion[carIdx][5];
+			//double vx = sensor_fusion[carIdx][3];
+			//double vy = sensor_fusion[carIdx][4];
+			//double check_speed = sqrt(vx*vx+vy*vy);
+			double check_speed = predictions[carIdx][0].speed;
+			double check_car_s = predictions[carIdx][0].s;
 			double distance_to_car = check_car_s - car.s;
 
 			// where will the car be in the future?
 			if( (check_car_s > car.s) && distance_to_car < speed_lookahead) {
 				// are we driving approximately the same speed as the other car?
-				if( fabs(check_speed - car.prev_speed) < 0.001 ) {
-					// we're driving at the same speed; make sure no collision
-					// make sure to drive a little slower
-					if( check_speed < car.prev_speed) {
-						// other car is driving a little slower
-						if( car._next_speed > check_speed) {
-							car.setNextSpeed(check_speed);
-						}
-					}
-				}
-
-				// car slower than ours or faster than ours?
-				else {
-					// car is slower
-					if( car._next_speed > check_speed) {
-						car.setNextSpeed(check_speed);
-					}
-				}
+				car.setNextSpeed(check_speed/0.44704);
 			}
 		}
 	}
-
-	// post processing
-	// increase speed?
-	if( fabs(car._next_speed - car.prev_speed) < 0.001 ) {
-		// just have similar speed
-	}
-	else if( car._next_speed > car.prev_speed) {
-		if(car.prev_speed <= 0.0001) {
-			car.setNextSpeed(car_acceptable_boost);
-		} else {
-			// how much faster?
-			double rate = car._next_speed / car.prev_speed;
-			double no_jerk_rate = (rate > car_acceptable_boost) ? car_acceptable_boost : rate;
-			car.setNextSpeed(car.prev_speed * no_jerk_rate);
-			//car.setNextSpeed(car.prev_speed + .5);
-		}
-	} else {
-		// problem with decreasing is that we don't filter out jerk, as we might need emergency brake
-		// let's say we have to make sure in 25 timeframes we have to match that speed
-		//double rate = (car.prev_speed - car._next_speed) / 25;
-		/*car.setNextSpeed(car.prev_speed / car_acceptable_boost);*/
-		car.setNextSpeed(car.prev_speed /1.1);
-	}
-
-	// speed limit ;)
-	if(car._next_speed > legal_speed_limit) {
-		car.setNextSpeed(legal_speed_limit);
-	}
-
-	cout << car.prev_speed << ", " << car._next_speed << ", " << fabs( car.prev_speed - car._next_speed ) << endl;
 }
 
-bool is_car_in_the_way_for_lane_change(const json& sensor_fusion, Car& car, const int& lane) {
-	double my_car_behind_s = car.s - 10;
-	double my_car_front_s = car.s + 20;
+bool is_car_in_the_way_for_lane_change(map<int, vector<Prediction>>& predictions, Car& car, const int& lane) {
+	double my_car_behind_s = car.s - 2.;
+	double my_car_front_s = car.s + 20.;
 
 	// is there a car int he lane?
-	for(int carIdx=0; carIdx<sensor_fusion.size(); carIdx++) {
-		float other_d = sensor_fusion[carIdx][6];
+	for(int carIdx=0; carIdx<predictions.size(); carIdx++) {
+		float other_d = predictions[carIdx][0].d;
 		// does the car collides with our car?
 		if(other_d < (2+4*lane+2) && other_d > (2+4*lane-2)) {
-			double check_car_s = sensor_fusion[carIdx][5];
 
-			if( check_car_s > my_car_behind_s && check_car_s < my_car_front_s) {
-				return true;
+			for( int posCtr=0; posCtr<10; posCtr++) {
+				double check_car_s = predictions[carIdx][posCtr].s;
+
+				if( check_car_s > my_car_behind_s && check_car_s < my_car_front_s) {
+					return true;
+				}
 			}
 		}
 	}
 	return false;
 }
 
-void apply_trajectory_LCL(const json& sensor_fusion, Car& car, const Road& road, int& lane) {
+void apply_trajectory_LCL(map<int, vector<Prediction>>& predictions, Car& car, const Road& road, int& lane) {
 
-	if( is_car_in_the_way_for_lane_change(sensor_fusion, car, lane-1) ) {
-		apply_trajectory_KL(sensor_fusion, car, road);
+	if( is_car_in_the_way_for_lane_change(predictions, car, lane-1) ) {
+		apply_trajectory_KL(predictions, car, road);
 	} else {
 		lane -=1;
 	}
 }
 
-void apply_trajectory_LCR(const json& sensor_fusion, Car& car, const Road& road, int& lane) {
+void apply_trajectory_LCR(map<int, vector<Prediction>>& predictions, Car& car, const Road& road, int& lane) {
 
-	if( is_car_in_the_way_for_lane_change(sensor_fusion, car, lane+1) ) {
-		apply_trajectory_KL(sensor_fusion, car, road);
+	if( is_car_in_the_way_for_lane_change(predictions, car, lane+1) ) {
+		apply_trajectory_KL(predictions, car, road);
 	} else {
 		lane +=1;
 	}
@@ -312,28 +278,58 @@ vector<double> getXY(double s, double d, const vector<double> &maps_s, const vec
 
 }
 
-void predict(const json& sensor_fusion) {
+map<int, vector<Prediction>> predict(const json& sensor_fusion, int prev_size) {
+
+	std::map<int, vector<Prediction>> retval;
+
 	for(int carIdx=0; carIdx<sensor_fusion.size(); carIdx++) {
+
+		// get the cars properties
+		double vx = sensor_fusion[carIdx][3];
+		double vy = sensor_fusion[carIdx][4];
+		double check_speed = sqrt(vx*vx+vy*vy);
+		double check_car_s = sensor_fusion[carIdx][5];
 		float other_d = sensor_fusion[carIdx][6];
+
+		vector<Prediction> positions;
+
+		for(int prd_step=prev_size; prd_step<50; prd_step++) {
+			double s = check_car_s + (prd_step * 0.02 * check_speed);
+
+			Prediction newPrediction;
+			newPrediction.s = s;
+			newPrediction.d = other_d;
+			newPrediction.speed = check_speed;
+			positions.push_back(newPrediction);
+
+		}
+
+		// and add to the map
+		retval[carIdx] = positions;
 	}
+
+	return retval;
 }
 
-double cost_for_lane(const Car& myself, const int lane, const json& sensor_fusion) {
+/**
+ * The idea is: the shorter the smallest distance between the ego car and any other car in the lane is
+ * the cost. The shorter the distance, the higher the cost
+ */
+double cost_for_lane(const Car& myself, const int lane, map<int, vector<Prediction>>& predictions) {
 
 	double shortest_car_distance_front = numeric_limits<double>::infinity();
 	double shortest_car_speed_front = numeric_limits<double>::infinity();
 
 	// based on speed
-	for(int carIdx=0; carIdx<sensor_fusion.size(); carIdx++) {
-		float other_d = sensor_fusion[carIdx][6];
+	for(int carIdx=0; carIdx<predictions.size(); carIdx++) {
+		// we assume the lane is constant in the predictions
+		float other_d = predictions[carIdx][0].d;
 
 		// is the car in the required lane?
 		if(other_d < (2+4*lane+2) && other_d > (2+4*lane-2)) {
 			// yes, find the first car in front, and check distance and speed
-			double vx = sensor_fusion[carIdx][3];
-			double vy = sensor_fusion[carIdx][4];
-			double check_speed = sqrt(vx*vx+vy*vy);
-			double check_car_s = sensor_fusion[carIdx][5];
+			double check_speed = predictions[carIdx][0].speed;
+			double check_car_s = predictions[carIdx][0].s;
 			double distance_to_car = check_car_s - myself.s;
 
 			// where will the car be in the future?
@@ -357,7 +353,8 @@ double cost_for_lane(const Car& myself, const int lane, const json& sensor_fusio
 	}
 }
 
-void moveCar(const Car& car, const Road& road, const vector<double>& map_waypoints_x, const vector<double>& map_waypoints_y,
+// TODO: car must be const!
+void moveCar(Car& car, const Road& road, const vector<double>& map_waypoints_x, const vector<double>& map_waypoints_y,
 		const vector<double>& map_waypoints_s, const vector<double>& map_waypoints_dx, const vector<double>& map_waypoints_dy,
 		vector<double>& next_x_vals, vector<double>& next_y_vals) {
 
@@ -443,8 +440,6 @@ void moveCar(const Car& car, const Road& road, const vector<double>& map_waypoin
 	double target_x = 30; // in 30meters...
 	double target_y = s(target_x); // what's the spline's y-value for the specified x-value
 	double target_dist = sqrt((target_x*target_x)+(target_y*target_y));
-	// TODO: preoper velocity!
-	double N = target_dist/(.02 * car._next_speed / 2.24);
 
 	// 3. fill the array with points
 	// fill the new list of points with all left-over points of the previously generated points
@@ -456,6 +451,21 @@ void moveCar(const Car& car, const Road& road, const vector<double>& map_waypoin
 	// and now, generate more points to fill the array
 	double x_add_on = 0;
 	for(int i=1; i<=50-prev_size; i++) {
+		// should we go faster?
+		if(car._next_speed > approx_speed) {
+			approx_speed += car_acceptable_boost;
+		} else {
+			approx_speed -= car_acceptable_boost;
+		}
+
+		// some final adjustements
+		if( approx_speed > legal_speed_limit) {
+			approx_speed = legal_speed_limit;
+		}
+
+		//std::cout << "OrigSpeed: " << car.prev_speed << " ;speed_loop: " << approx_speed << std::endl;
+
+		double N = target_dist/(.02 * approx_speed / 2.24);
 		double x_point = x_add_on + (target_x) / N; // the next x-point
 		double y_point = s(x_point); // the next y-point (provided by the spline)
 		x_add_on = x_point;
@@ -568,28 +578,24 @@ int main() {
           	// definitions
 
           	// 1. prediction
+          	map<int, vector<Prediction>> predictions = predict(sensor_fusion, previous_path_x.size());
 
           	// 2. behaviour planning
           	string next_state = "KL";
-          	double cost_for_KL =  (0.9 * cost_for_lane(myself, lane, sensor_fusion));
-          	double cost_for_LCL = (lane == 0 ) ? 5 : .1 + (.9 * cost_for_lane(myself, lane-1, sensor_fusion) );
-          	double cost_for_LCR = (lane == 2 ) ? 5 : .1 + (.098 * cost_for_lane(myself, lane+1, sensor_fusion) );
+          	double cost_for_KL = cost_for_lane(myself, lane, predictions);
+          	double cost_for_LCL = (lane == 0) ? 5. : cost_for_lane(myself, lane -1, predictions);
+          	double cost_for_LCR = (lane == 2) ? 5. : cost_for_lane(myself, lane + 1, predictions);
 
-          	if(lane != 2 && cost_for_LCR < cost_for_KL && cost_for_LCR < cost_for_LCL ) {
+            if(lane != 2 && cost_for_LCR < cost_for_KL && cost_for_LCR < cost_for_LCL ) {
           		next_state = "LCR";
           	} else if( lane != 0 && cost_for_LCL < cost_for_KL && cost_for_LCL < cost_for_LCR ) {
           		next_state = "LCL";
           	}
 
-          	// TODO: remove this
-          	if( myself.prev_speed < 20 && next_state != "KL") {
-          		next_state = "KL";
-          	}
-
           	// 3. trajectory generation
-          	if( next_state == "KL" ) apply_trajectory_KL(sensor_fusion, myself, road);
-          	if( next_state == "LCL") apply_trajectory_LCL(sensor_fusion, myself, road, lane);
-          	if( next_state == "LCR") apply_trajectory_LCR(sensor_fusion, myself, road, lane);
+          	if( next_state == "KL" ) apply_trajectory_KL(predictions, myself, road);
+          	if( next_state == "LCL") apply_trajectory_LCL(predictions, myself, road, lane);
+          	if( next_state == "LCR") apply_trajectory_LCR(predictions, myself, road, lane);
           	moveCar(myself, road, map_waypoints_x, map_waypoints_y, map_waypoints_s, map_waypoints_dx, map_waypoints_dy, next_x_vals, next_y_vals);
 
           	// TODO: define a path made up of (x,y) points that the car will visit sequentially every .02 seconds
